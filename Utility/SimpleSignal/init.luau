@@ -9,18 +9,9 @@ local Types 				= require(script.Types)
 export type RBXScriptConnection 	= Types.RBXScriptConnection
 export type RBXScriptSignal<T...> = Types.RBXScriptSignal<T...>
 
-local freeRunnerThread 		= nil
-
-local function acquireRunnerThreadAndCallEventHandler(fn, ...)
-	local acquiredRunnerThread = freeRunnerThread
-	freeRunnerThread = nil
-	fn(...)
-	freeRunnerThread = acquiredRunnerThread
-end
-
-local function runEventHandlerInFreeThread()
+local function threadWorker(fn)
 	while true do
-		acquireRunnerThreadAndCallEventHandler(coroutine.yield())
+		fn(coroutine.yield())
 	end
 end
 
@@ -29,9 +20,9 @@ Connection.__index = Connection
 
 function Connection:Disconnect()
 	if not self.Connected then return end
+	self.Connected = false
 	
 	local connections = self._connections
-	local pos = self._pos
 	local l = #connections
 	if l == 1 then
 		connections[l] = nil
@@ -39,14 +30,15 @@ function Connection:Disconnect()
 		return
 	end
 	
-	local val = connections[pos]
-	local last = connections[l]
-
-	connections[pos] = last
-	connections[l] = nil
-	last._pos = self._pos
+	local pos = self._pos
 	
-	self.Connected = false
+	local val, last = connections[pos], connections[l]
+	last._pos = pos
+	
+	connections[pos], connections[l] = last, nil
+	
+	coroutine.close(self._thread)
+	self._thread = nil
 end
 
 local Signal = {}
@@ -65,7 +57,7 @@ function Signal:Connect(fn)
 	local connections = self.Connections
 	local index = #connections + 1
 	local connection = setmetatable({
-		_fn = fn,
+		_thread = task.spawn(threadWorker, fn),
 		_pos = index,
 		_connections = connections,
 
@@ -93,18 +85,18 @@ end
 function Signal:DisconnectAll()
 	for _, connection in self.Connections do
 		connection.Connected = false
+		coroutine.close(connection._thread)
+		connection._thread = nil
 	end
 	table.clear(self.Connections)
 end
 
 function Signal:Fire(...)
-	if #self.Connections == 0 then return end
+	local l = #self.Connections
+	if l == 0 then return end
 	
 	for _, connection in self.Connections do
-		if not freeRunnerThread then
-			freeRunnerThread = task.spawn(runEventHandlerInFreeThread)
-		end
-		task.spawn(freeRunnerThread, connection._fn, ...)
+		coroutine.resume(connection._thread, ...)
 	end
 end
 
@@ -119,7 +111,7 @@ function Signal:Wait()
 			return
 		end
 		
-		task.spawn(running, ...)
+		coroutine.resume(running, ...)
 	end)
 	
 	return coroutine.yield()
