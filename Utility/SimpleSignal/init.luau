@@ -46,8 +46,11 @@ local function call(c: RBXScriptConnection, fn, ...)
 	end
 end
 
-local function mainThreadWorker(c: RBXScriptConnection)
+local function mainThreadWorker(c: RBXScriptConnection, a, ...)
 	local fn = c._fn
+	if a then
+		call(c, fn, a, ...)
+	end
 	
 	while true do
 		call(c, fn, coroutine.yield())
@@ -93,7 +96,7 @@ local function signal_connect<T...>(self: RBXScriptSignal<T...>, fn: (T...) -> (
 
 	local connections = self.Connections
 	local index = #connections + 1
-	local connection = {
+	local connection: RBXScriptConnection = {
 		_pos = index,
 		_connections = connections,
 		_fn = fn,
@@ -103,7 +106,10 @@ local function signal_connect<T...>(self: RBXScriptSignal<T...>, fn: (T...) -> (
 		Disconnect = connection_disconnect
 	}
 	-- Ensure the thread has a reference to the connection
-	connection._mainThread = task.spawn(mainThreadWorker, connection)
+	local t = coroutine.create(mainThreadWorker)
+	coroutine.resume(t, connection)
+	
+	connection._mainThread = t
 	table.insert(connections, connection)
 	
 	return connection
@@ -128,23 +134,32 @@ local function signal_fire<T...>(self: RBXScriptSignal<T...>, ...: T...): ()
 	local connections = self.Connections
 	local l = #connections
 	if l == 0 then return end
-	
+
 	for i = l, 1, -1 do
 		local connection = connections[i]
 		local t = connection._mainThread :: thread
 		if t == nil then
-			local new = task.spawn(mainThreadWorker, connection)
+			local new = coroutine.create(mainThreadWorker)
+			local success, err = coroutine.resume(new, connection, ...)
+			if success == false then
+				self:DisconnectAll()
+				error(err, 10)
+			end
+			
 			connection._mainThread = new
-			coroutine.resume(new, ...)
 		else
-			coroutine.resume(t, ...)
+			local success, err = coroutine.resume(t, ...)
+			if success == false then
+				self:DisconnectAll()
+				error(err, 10)
+			end
 		end
 	end
 end
 
 local function signal_once<T...>(self: RBXScriptSignal<T...>, fn): RBXScriptConnection
 	assert(type(fn) == "function", `Function expected, got {fn}`)
-
+	
 	local connection
 	connection = self:Connect(function(...)
 		connection:Disconnect()
@@ -173,7 +188,7 @@ local function signal_wait<T...>(self: RBXScriptSignal<T...>): T...
 end
 
 -- Create a new <code>RBXScriptSignal</code> object.
-local function signal_new<T...>(): RBXScriptSignal<T...>
+local function signal_new<T...>(deferred: boolean): RBXScriptSignal<T...>
 	return {
 		Connections = {},
 
