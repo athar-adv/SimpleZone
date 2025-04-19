@@ -1,20 +1,20 @@
 --!optimize 2
 --!native
---!nonstrict
+--!strict
 
 -- SIMPLESIGNAL UTILITY MODULE
--- GoodSignal but simple(r) :)
+-- GoodSignal but simple
 -- Author: athar_adv
 
 --[[
 	This module is distributed under a modified MIT license
 	
-	Copyright (c) 2025 SimpleSignal
+	Copyright (c) 2025 athar_adv
 
 	Permission is hereby granted, free of charge, to any person obtaining a copy
 	of this software and associated documentation files (the "Software"), to deal
 	in the Software without restriction, including without limitation the rights
-	to use, merge, publish, distribute, and/or sell
+	to use, copy, merge, publish, distribute, sublicense, and/or sell
 	copies of the Software, and to permit persons to whom the Software is
 	furnished to do so, subject to the following conditions:
 
@@ -32,89 +32,59 @@
 
 local Types = require(script.Types)
 
-export type RBXScriptConnection = Types.RBXScriptConnection
-export type RBXScriptSignal<T...=()> = Types.RBXScriptSignal<T...>
-
-local threadPool = {}
-local freeThreads = 0
-local totalConnectionCount = 0
+export type RBXScriptConnection	= Types.RBXScriptConnection
+export type RBXScriptSignal<T...=(any)> = Types.RBXScriptSignal<T...>
 
 local SUSPENDED = "suspended"
-local ThreadCleanInterval = 1
 
-local function threadHandler(idx, fn, ...)
-	local last = threadPool[freeThreads]
-	threadPool[idx], threadPool[freeThreads] = last, nil
-
-	freeThreads -= 1
+local function call(c: RBXScriptConnection, fn, ...)
+	local old = c._mainThread
+	c._mainThread = nil
 	fn(...)
+	if c.Connected then
+		c._mainThread = old
+	end
 end
 
-local function threadWorker(i)
-	local running = coroutine.running()
+local function mainThreadWorker(c: RBXScriptConnection)
+	local fn = c._fn
 	
 	while true do
-		threadHandler(i, coroutine.yield())
-		freeThreads += 1
-		i = freeThreads
-		
-		table.insert(threadPool, running)
+		call(c, fn, coroutine.yield())
+		if c.Connected == false then
+			-- Kill the thread
+			return
+		end
 	end
 end
 
-local function preallocateThreads(n: number)
-	local original = freeThreads
-	freeThreads += n
-	for i = 1, n do
-		local t = task.spawn(threadWorker, original + i)
-
-		table.insert(threadPool, t)
-	end
-end
-
-local function deallocateThreads(n: number)
-	freeThreads -= n
-
-	local i, l = n, #threadPool
-	
-	while i > 0 and i <= l do
-		l = #threadPool
-		if l == 0 then break end
-		
-		local curr = threadPool[i]
-		if coroutine.status(curr) ~= SUSPENDED then continue end
-		
-		coroutine.close(curr)
-		local last = threadPool[l]
-		
-		threadPool[i], threadPool[l] = last, nil
-		i -= 1
-	end
-end
-
-local function connection_disconnect(self: RBXScriptConnection)
+local function connection_disconnect(self: RBXScriptConnection): ()
 	if not self.Connected then return end
 	self.Connected = false
 
+	local t = self._mainThread
+	if t then
+		coroutine.close(t)
+	end
+	self._mainThread = nil
+
 	local connections = self._connections
 	local l = #connections
-	if l == 1 then
+	local pos = self._pos
+
+	if l == pos then
 		connections[l] = nil
+		self.Connected = false
 		return
 	end
-
-	local pos = self._pos
 	local last = connections[l]
 	last._pos = pos
 
 	connections[pos], connections[l] = last, nil
-	totalConnectionCount -= 1
 end
 
 local function signal_destroy<T...>(self: RBXScriptSignal<T...>): ()
-	deallocateThreads(self._allocatedThreads)
 	self:DisconnectAll()
-	
 	table.clear(self)
 end
 
@@ -124,22 +94,55 @@ local function signal_connect<T...>(self: RBXScriptSignal<T...>, fn: (T...) -> (
 	local connections = self.Connections
 	local index = #connections + 1
 	local connection = {
-		_fn = fn,
 		_pos = index,
 		_connections = connections,
+		_fn = fn,
 
 		Connected = true,
-		
+
 		Disconnect = connection_disconnect
 	}
-	
+	-- Ensure the thread has a reference to the connection
+	connection._mainThread = task.spawn(mainThreadWorker, connection)
 	table.insert(connections, connection)
-	totalConnectionCount += 1
-
+	
 	return connection
 end
 
-local function signal_once<T...>(self: RBXScriptSignal<T...>, fn: (T...) -> ()): RBXScriptConnection
+local function signal_disconnectAll<T...>(self: RBXScriptSignal<T...>): ()
+	local connections = self.Connections
+	local l = #connections
+	
+	for _, connection in connections do
+		connection.Connected = false
+		local t = connection._mainThread
+		if not t then continue end
+		
+		coroutine.close(t)
+		connection._mainThread = nil
+	end
+	table.clear(connections)
+end
+
+local function signal_fire<T...>(self: RBXScriptSignal<T...>, ...: T...): ()
+	local connections = self.Connections
+	local l = #connections
+	if l == 0 then return end
+	
+	for i = l, 1, -1 do
+		local connection = connections[i]
+		local t = connection._mainThread :: thread
+		if t == nil then
+			local new = task.spawn(mainThreadWorker, connection)
+			connection._mainThread = new
+			coroutine.resume(new, ...)
+		else
+			coroutine.resume(t, ...)
+		end
+	end
+end
+
+local function signal_once<T...>(self: RBXScriptSignal<T...>, fn): RBXScriptConnection
 	assert(type(fn) == "function", `Function expected, got {fn}`)
 
 	local connection
@@ -150,35 +153,6 @@ local function signal_once<T...>(self: RBXScriptSignal<T...>, fn: (T...) -> ()):
 	end)
 
 	return connection
-end
-
-local function signal_disconnectAll<T...>(self: RBXScriptSignal<T...>): ()
-	local connections = self.Connections
-	local l = #connections
-	
-	for _, connection in connections do
-		connection.Connected = false
-	end
-	table.clear(connections)
-	totalConnectionCount -= l
-end
-
-local function signal_fire<T...>(self: RBXScriptSignal<T...>, ...: T...): ()
-	local connections = self.Connections
-	local l = #connections
-	if l == 0 then return end
-	
-	if freeThreads < l then
-		local diff = l - freeThreads
-		preallocateThreads(diff)
-		self._allocatedThreads += diff
-	end
-	
-	for i = l, 1, -1 do
-		local connection = connections[i]
-		local last = threadPool[freeThreads]
-		coroutine.resume(last, connection._fn, ...)
-	end
 end
 
 local function signal_wait<T...>(self: RBXScriptSignal<T...>): T...
@@ -192,7 +166,7 @@ local function signal_wait<T...>(self: RBXScriptSignal<T...>): T...
 			return
 		end
 
-		task.spawn(running, ...)
+		coroutine.resume(running, ...)
 	end)
 
 	return coroutine.yield()
@@ -202,36 +176,16 @@ end
 local function signal_new<T...>(): RBXScriptSignal<T...>
 	return {
 		Connections = {},
-		_allocatedThreads = 0,
-		
+
+		Destroy = signal_destroy,
 		Connect = signal_connect,
+		Fire = signal_fire,
 		Once = signal_once,
 		Wait = signal_wait,
-		
-		Fire = signal_fire,
-		DisconnectAll = signal_disconnectAll,
-		Destroy = signal_destroy,
+		DisconnectAll = signal_disconnectAll
 	}
 end
 
-local function setCleaningInterval(n: number)
-	ThreadCleanInterval = n
-end
-
--- GC loop to clean up the allocated threads based on total connection count
-task.spawn(function()
-	while true do
-		task.wait(ThreadCleanInterval)
-		local l = #threadPool
-		if l <= totalConnectionCount then continue end
-		
-		local diff = l - totalConnectionCount
-		
-		deallocateThreads(diff)
-	end
-end)
-
 return {
-	new = signal_new,
-	setCleaningInterval = setCleaningInterval
+	new = signal_new
 }
