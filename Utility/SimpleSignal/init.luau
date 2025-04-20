@@ -2,33 +2,9 @@
 --!native
 --!strict
 
--- SIMPLESIGNAL UTILITY MODULE
--- GoodSignal but simple
+--[[ SimpleSignal ]]
+
 -- Author: athar_adv
-
---[[
-	This module is distributed under a modified MIT license
-	
-	Copyright (c) 2025 athar_adv
-
-	Permission is hereby granted, free of charge, to any person obtaining a copy
-	of this software and associated documentation files (the "Software"), to deal
-	in the Software without restriction, including without limitation the rights
-	to use, copy, merge, publish, distribute, sublicense, and/or sell
-	copies of the Software, and to permit persons to whom the Software is
-	furnished to do so, subject to the following conditions:
-
-	The above copyright notice and this permission notice shall be included in all
-	copies or substantial portions of the Software.
-
-	THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-	IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-	FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-	AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-	LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-	OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-	SOFTWARE.
-]]
 
 local Types = require(script.Types)
 
@@ -36,6 +12,11 @@ export type RBXScriptConnection	= Types.RBXScriptConnection
 export type RBXScriptSignal<T...=(any)> = Types.RBXScriptSignal<T...>
 
 local SUSPENDED = "suspended"
+-- ConnectParallel will error if not called from an Actor context
+local IS_PARALLEL_CONTEXT = pcall(function()
+	local c = game.Destroying:ConnectParallel(function()end)
+	c:Disconnect()
+end)
 
 local function call(c: RBXScriptConnection, fn, ...)
 	local old = c._mainThread
@@ -46,18 +27,27 @@ local function call(c: RBXScriptConnection, fn, ...)
 	end
 end
 
+local function callParallel(c: RBXScriptConnection, fn, ...)
+	local old = c._mainThread
+	c._mainThread = nil
+	task.desynchronize()
+	fn(...)
+	task.synchronize()
+	if c.Connected then
+		c._mainThread = old
+	end
+end
+
 local function mainThreadWorker(c: RBXScriptConnection, a, ...)
 	local fn = c._fn
+	local callFunction = (c._isParallel and callParallel or call) :: (...any) -> ()
+	-- Initial call if arguments are provided (so coroutine.resume doesn't have to be called twice)
 	if a then
-		call(c, fn, a, ...)
+		callFunction(c, fn, a, ...)
 	end
 	
-	while true do
-		call(c, fn, coroutine.yield())
-		if c.Connected == false then
-			-- Kill the thread
-			return
-		end
+	while c.Connected do
+		callFunction(c, fn, coroutine.yield())
 	end
 end
 
@@ -77,7 +67,6 @@ local function connection_disconnect(self: RBXScriptConnection): ()
 
 	if l == pos then
 		connections[l] = nil
-		self.Connected = false
 		return
 	end
 	local last = connections[l]
@@ -93,19 +82,43 @@ end
 
 local function signal_connect<T...>(self: RBXScriptSignal<T...>, fn: (T...) -> ()): RBXScriptConnection
 	assert(type(fn) == "function", `Function expected, got {fn}`)
-
 	local connections = self.Connections
 	local index = #connections + 1
+	
 	local connection: RBXScriptConnection = {
 		_pos = index,
 		_connections = connections,
 		_fn = fn,
-
+		_isParallel = false,
+		
 		Connected = true,
-
 		Disconnect = connection_disconnect
 	}
 	-- Ensure the thread has a reference to the connection
+	local t = coroutine.create(mainThreadWorker)
+	coroutine.resume(t, connection)
+	
+	connection._mainThread = t
+	table.insert(connections, connection)
+	
+	return connection
+end
+-- Essentially the same as connect, just setting the isParallel flag and asserting if inside an Actor context
+local function signal_connectParallel<T...>(self: RBXScriptSignal<T...>, fn: (T...) -> ()): RBXScriptConnection
+	assert(type(fn) == "function", `Function expected, got {fn}`)
+	assert(IS_PARALLEL_CONTEXT, "Scripts that connect in parallel must be rooted under an Actor.")
+	local connections = self.Connections
+	local index = #connections + 1
+
+	local connection: RBXScriptConnection = {
+		_pos = index,
+		_connections = connections,
+		_fn = fn,
+		_isParallel = true,
+
+		Connected = true,
+		Disconnect = connection_disconnect
+	}
 	local t = coroutine.create(mainThreadWorker)
 	coroutine.resume(t, connection)
 	
@@ -138,22 +151,19 @@ local function signal_fire<T...>(self: RBXScriptSignal<T...>, ...: T...): ()
 	for i = l, 1, -1 do
 		local connection = connections[i]
 		local t = connection._mainThread :: thread
-		if t == nil then
-			local new = coroutine.create(mainThreadWorker)
-			local success, err = coroutine.resume(new, connection, ...)
-			if success == false then
-				self:DisconnectAll()
-				error(err, 10)
-			end
-			
-			connection._mainThread = new
-		else
+		-- If the main thread is done being used, it can simply be reused (fast path)
+		if t ~= nil then
 			local success, err = coroutine.resume(t, ...)
-			if success == false then
-				self:DisconnectAll()
-				error(err, 10)
-			end
+			assert(success, err)
+			continue
 		end
+		-- If the main thread is still being used (aka yielding), 
+		-- create a new one and set it as the new main thread (slow path)
+		local new = coroutine.create(mainThreadWorker)
+		local success, err = coroutine.resume(new, connection, ...)
+		assert(success, err)
+
+		connection._mainThread = new
 	end
 end
 
@@ -163,7 +173,6 @@ local function signal_once<T...>(self: RBXScriptSignal<T...>, fn): RBXScriptConn
 	local connection
 	connection = self:Connect(function(...)
 		connection:Disconnect()
-
 		fn(...)
 	end)
 
@@ -172,15 +181,10 @@ end
 
 local function signal_wait<T...>(self: RBXScriptSignal<T...>): T...
 	local running = coroutine.running()
+	
 	local connection
-
 	connection = self:Connect(function(...)
 		connection:Disconnect()
-
-		if coroutine.status(running) ~= "suspended" then
-			return
-		end
-
 		coroutine.resume(running, ...)
 	end)
 
@@ -188,12 +192,14 @@ local function signal_wait<T...>(self: RBXScriptSignal<T...>): T...
 end
 
 -- Create a new <code>RBXScriptSignal</code> object.
-local function signal_new<T...>(deferred: boolean): RBXScriptSignal<T...>
+local function signal_new<T...>(): RBXScriptSignal<T...>
 	return {
 		Connections = {},
 
 		Destroy = signal_destroy,
 		Connect = signal_connect,
+		ConnectParallel = signal_connectParallel,
+		
 		Fire = signal_fire,
 		Once = signal_once,
 		Wait = signal_wait,
